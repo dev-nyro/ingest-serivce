@@ -1,0 +1,124 @@
+name: CI/CD Pipeline Docker -> Manifest Update
+
+on:
+  push:
+    branches: [ "develop" ] # Dispara en push a la rama main
+  # Opcional: Descomenta si quieres que corra también en Pull Requests a main (sin hacer push/update)
+  # pull_request:
+  #   branches: [ "main" ]
+
+env:
+  # --- AJUSTA ESTAS VARIABLES ---
+  REGISTRY: ghcr.io                             # Usaremos GitHub Container Registry
+  # Reemplaza 'dev-nyro' con tu usuario u organización de GitHub
+  # Reemplaza 'ingest-service' con el nombre deseado para tu imagen
+  IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
+  MANIFEST_REPO_OWNER: dev-nyro                 # Dueño del repo de manifiestos
+  MANIFEST_REPO_NAME: manifests-nyro            # Nombre del repo de manifiestos
+  MANIFEST_REPO_BRANCH: develop                    # Rama a actualizar en el repo de manifiestos
+  MANIFEST_PATH_API: ingest-service/deployment-api.yaml    # Ruta al deployment API en el repo de manifiestos
+  MANIFEST_PATH_WORKER: ingest-service/deployment-worker.yaml # Ruta al deployment Worker en el repo de manifiestos
+  # --- FIN DE VARIABLES AJUSTABLES ---
+
+jobs:
+  build-push-update:
+    runs-on: ubuntu-latest # Usamos un runner estándar hospedado por GitHub
+
+    # Permisos necesarios:
+    # contents: read - para hacer checkout del código de la app
+    # packages: write - para hacer push de la imagen a GHCR
+    # id-token: write - (Opcional, para autenticación OIDC si se usa en lugar de PAT/GITHUB_TOKEN)
+    permissions:
+      contents: read
+      packages: write
+      # Descomenta si usas OIDC en lugar de GITHUB_TOKEN para Docker login
+      # id-token: write
+
+    steps:
+      # 1. Checkout del código de la aplicación
+      - name: Checkout Application Code
+        uses: actions/checkout@v4
+
+      # 2. Configurar Docker Buildx (recomendado para build-push-action)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Login a GitHub Container Registry (GHCR)
+      #    Usa GITHUB_TOKEN que se provee automáticamente para autenticar.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}       # Usuario de GitHub que ejecuta la acción
+          password: ${{ secrets.GITHUB_TOKEN }} # Token automático de la acción
+
+      # 4. Generar etiqueta para la imagen (similar a Tekton: branch-commitsha)
+      - name: Generate Image Tag
+        id: image_tag
+        run: |
+          # Usar el nombre de la rama (ref_name) y el hash corto del commit
+          TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
+          # Asegurarse que la etiqueta sea válida para Docker (ej: reemplazar / en feature/branch)
+          TAG=$(echo $TAG | sed 's/[^a-zA-Z0-9.-]/-/g')
+          echo "Generated Tag: $TAG"
+          # Guardar la etiqueta completa de la imagen para usarla después
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "full_image_name=${{ env.IMAGE_NAME }}:$TAG" >> $GITHUB_OUTPUT
+
+      # 5. Construir y Empujar la imagen Docker a GHCR
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: . # Directorio que contiene el Dockerfile (raíz del repo)
+          file: ./Dockerfile # Ruta al Dockerfile
+          push: ${{ github.event_name == 'push' }} # Solo hacer push si el evento es un 'push' (no en PRs)
+          tags: ${{ steps.image_tag.outputs.full_image_name }} # Usa la etiqueta generada
+          cache-from: type=gha # Habilitar caché de build de GitHub Actions
+          cache-to: type=gha,mode=max
+
+      # --- Actualización del Repositorio de Manifests ---
+      # Solo ejecutar si el evento fue un push a la rama 'main'
+      - name: Checkout Manifests Repository
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }} # Repo de manifests
+          ref: ${{ env.MANIFEST_REPO_BRANCH }}         # Rama a actualizar
+          token: ${{ secrets.MANIFEST_PAT }}           # PAT para poder hacer push
+          path: manifests-repo                       # Clonar en un directorio específico
+
+      - name: Update Manifest Files
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "Updating manifests with image: ${{ steps.image_tag.outputs.full_image_name }}"
+          cd manifests-repo
+
+          # Usar sed para reemplazar la línea 'image:'. Usamos '|' como delimitador
+          # porque el nombre de la imagen contiene '/'
+          sed -i "s|image: .*|image: ${{ steps.image_tag.outputs.full_image_name }}|" "${{ env.MANIFEST_PATH_API }}"
+          sed -i "s|image: .*|image: ${{ steps.image_tag.outputs.full_image_name }}|" "${{ env.MANIFEST_PATH_WORKER }}"
+
+          echo "Manifest files updated."
+          # Mostrar cambios (opcional)
+          git status
+          git diff
+
+      - name: Commit and Push Manifest Changes
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cd manifests-repo
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # Añadir los archivos modificados
+          git add "${{ env.MANIFEST_PATH_API }}" "${{ env.MANIFEST_PATH_WORKER }}"
+
+          # Verificar si hay cambios para commitear
+          if git diff --staged --quiet; then
+            echo "No changes detected in manifests. Nothing to commit."
+          else
+            echo "Committing changes..."
+            git commit -m "Update image to ${{ steps.image_tag.outputs.full_image_name }} [CI]"
+            echo "Pushing changes to ${{ env.MANIFEST_REPO_BRANCH }} branch..."
+            git push origin ${{ env.MANIFEST_REPO_BRANCH }}
+          fi
